@@ -2,9 +2,10 @@ using GLV
 using CairoMakie
 using LinearAlgebra
 using Distributions
+using DataFrames
 set_theme!(theme_minimal())
 
-n_per_tl = (20, 10, 5, 5)
+n_per_tl = (10, 10, 10, 10)
 S = sum(n_per_tl)
 
 function create_trophic_community(
@@ -12,18 +13,18 @@ function create_trophic_community(
     D_e = LogNormal(log(0.5), 0.5),
     D_a = Normal(1, 0.1),
     D_c = Normal(-0.1, 0.01),
-    u_prod = 1,
-    u_cons = -0.1,
     K_i = Normal(1, 0.3),
+    Z = 1,
     r_i = 1,
 )
     S = sum(n_per_tl)
     A = zeros(S, S)
     tl = vcat([fill(i, n) for (i, n) in enumerate(n_per_tl)]...)
+    m = Z .^ (tl .- 1) # Metabolism.
     for i in 1:S, j in (i+1):S
         if (tl[j] - tl[i]) == 1 # Predation.
             e, a = rand(D_e), rand(D_a)
-            A[i, j] = -a
+            A[i, j] = -m[j] / m[i] * a
             A[j, i] = e * a
         elseif (tl[j] - tl[i]) == 0 # Intraguild competition.
             A[i, j] = rand(D_c)
@@ -31,48 +32,123 @@ function create_trophic_community(
         end
     end
     A[diagind(A)] .= -1 # Self-regulation.
-    u = [t == 1 ? u_prod : u_cons for t in tl]
+    u = [t == 1 ? 1 : -0.1 for t in tl] #.* m
     K = rand(K_i, S)
-    r = fill(r_i, S)
+    r = fill(r_i, S) .* m
     θ = fill(1, S)
     Community(A, r, K, u, θ)
 end
-D_e = Normal(0.9, 0)
-D_a = Normal(4 / S, 0.1 / sqrt(S))
-D_c = Normal(-0.1 / S, 0.1 / sqrt(S))
 
-iter = 0
-Beq = fill(-1, S)
-while any(Beq .< 0) && iter < 10_000
-    c = create_trophic_community(n_per_tl; D_e, D_a, D_c)
-    Beq = abundance(c)
-    iter += 1
+params_dict = Dict(
+    :inversed => (e = 0.8, Z = 0.1, a = 10),
+    :pyramid => (e = 0.5, Z = 0.8, a = 10),
+    :cascade => (e = 0.8, Z = 0.8, a = 15),
+)
+
+com_dict = Dict()
+for (key, params) in params_dict
+    D_e = Normal(params.e, 0)
+    D_a = Normal(params.a / S, 0 / sqrt(S))
+    D_c = Normal(-0.0 / S, 0.0 / sqrt(S))
+    iter = 0
+    Beq = fill(-1, S)
+    while any(Beq .< 1e-2) && iter < 10_000
+        c = create_trophic_community(n_per_tl; D_e, D_a, D_c, Z = params.Z)
+        Beq = abundance(c)
+        iter += 1
+    end
+    @info Beq
+    com_dict[key] = c
 end
+
+df = DataFrame(;
+    com = Symbol[],
+    tl = Float64[],
+    sl = Float64[],
+    s = Float64[],
+    B = Float64[],
+)
 
 n_rep = 1_000
-D = LogNormal(log(0.05), 0.5)
-c_copy = deepcopy(c)
-s_matrix = zeros(n_rep, S)
-for k in 1:n_rep
-    kappa = -rand(D, S)
-    c_copy.K = c.K .* (1 .+ kappa)
-    Bpress = abundance(c_copy)
-    s_matrix[k, :] = (Bpress .- Beq) ./ Beq ./ kappa
-end
-s = vec(mean(s_matrix; dims = 1))
-ry = relative_yield(c)
+D = LogNormal(log(0.01), 0.5)
 tl = vcat([fill(i, n) for (i, n) in enumerate(n_per_tl)]...)
+for (key, c) in com_dict
+    ry = relative_yield(c)
+    Beq = abundance(c)
+    c_copy = deepcopy(c)
+    for k in 1:n_rep
+        # kappa = -0.1 * rand(D, S)
+        # c_copy.K = c.K .* (1 .+ kappa)
+        du_u = -0.1 * rand(D, S)
+        u_press = c.u + du_u .* abs.(c.u)
+        c_copy.u = u_press
+        Bpress = abundance(c_copy)
+        s = (Bpress .- Beq) ./ Beq ./ du_u
+        append!(df, (com = fill(key, S), tl = tl, sl = ry, s = s, B = Beq))
+    end
+end
 
+function predict_sl(e, Z, a, B_per_tl, S_per_tl)
+    S = sum(S_per_tl)
+    n_tl = length(B_per_tl)
+    pred = zeros(n_tl)
+    for t in 1:n_tl
+        B_mean = B_per_tl[t] / S_per_tl[t]
+        B_prey = t > 1 ? B_per_tl[t-1] : 0
+        B_pred = t < n_tl ? B_per_tl[t+1] : 0
+        pred[t] = 1 / (1 - (e * a / S * B_prey - Z * a / S * B_pred) / B_mean)
+    end
+    pred
+end
+
+
+df_avg = combine(groupby(df, [:com, :tl, :sl, :B]), :s => mean)
 
 inch = 96
 pt = 4 / 3
 cm = inch / 2.54
-width = 8.7cm
-fig = Figure(; size = (width, 0.7width), fontsize = 8pt);
-ax = Axis(fig[1, 1]; xlabel = "1 / SL", ylabel = "Sensitivity to press")
-for t in unique(tl)
-    t_idx = tl .== t
-    scatter!(1 ./ ry[t_idx], s[t_idx]; label = "TL = $t", alpha = 0.5)
+width = 10cm
+fig = Figure(; size = (width, width), fontsize = 8pt);
+for (i, com) in enumerate(keys(com_dict))
+    df_com = subset(df_avg, :com => ByRow(==(com)))
+    ax1 = Axis(fig[i, 1]; xlabel = "Trophic level", ylabel = "SL")
+    boxplot!(df_com.tl, df_com.sl; color = :grey)
+    ax2 = Axis(fig[i, 2]; xlabel = "Trophic level", ylabel = "Sensitivity to press")
+    boxplot!(df_com.tl, df_com.s_mean; color = :grey)
+    ax3 = Axis(fig[i, 3]; xlabel = "Total biomass", ylabel = "Trophic level")
+    tl_unique = sort(unique(df_com.tl))
+    B_tl = [mean(df_com.B[df_com.tl.==t]) for t in tl_unique]
+    p = params_dict[com]
+    sl_pred = predict_sl(p.e, p.Z, p.a, B_tl, n_per_tl)
+    barplot!(tl_unique, B_tl; color = :grey, direction = :x)
+    scatter!(ax1, tl_unique, sl_pred; color = :red)
+    Label(fig[i, 4], string(com); rotation = 3pi / 2, tellheight = false)
 end
-axislegend()
 fig
+
+save("figures/tl-vs-sl.png", fig)
+
+inch = 96
+pt = 4 / 3
+cm = inch / 2.54
+width = 10cm
+fig = Figure(; size = (width, width), fontsize = 8pt);
+for (i, com) in enumerate(keys(com_dict))
+    df_com = subset(df_avg, :com => ByRow(==(com)), :tl => ByRow(>=(2)))
+    ax1 = Axis(fig[i, 1]; xlabel = "Trophic level", ylabel = "SL")
+    boxplot!(df_com.tl, df_com.sl; color = :grey)
+    ax2 = Axis(fig[i, 2]; xlabel = "Trophic level", ylabel = "Sensitivity to press")
+    boxplot!(df_com.tl, df_com.s_mean; color = :grey)
+    ax3 = Axis(fig[i, 3]; xlabel = "Total biomass", ylabel = "Trophic level")
+    df_com = subset(df_avg, :com => ByRow(==(com)))
+    tl_unique = sort(unique(df_com.tl))
+    B_tl = [mean(df_com.B[df_com.tl.==t]) for t in tl_unique]
+    p = params_dict[com]
+    sl_pred = predict_sl(p.e, p.Z, p.a, B_tl, n_per_tl)
+    barplot!(tl_unique, B_tl; color = :grey, direction = :x)
+    scatter!(ax1, tl_unique[2:end], sl_pred[2:end]; color = :red)
+    Label(fig[i, 4], string(com); rotation = 3pi / 2, tellheight = false)
+end
+fig
+
+save("figures/tl-vs-sl_no-producers.png", fig)
