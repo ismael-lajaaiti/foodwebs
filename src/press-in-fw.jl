@@ -1,3 +1,4 @@
+using StatsBase
 using GLV
 using CairoMakie
 using LinearAlgebra
@@ -7,6 +8,7 @@ set_theme!(theme_minimal())
 
 n_per_tl = (10, 10, 10, 10)
 S = sum(n_per_tl)
+n_tl = length(n_per_tl)
 
 function create_trophic_community(
     n_per_tl;
@@ -41,7 +43,7 @@ end
 
 params_dict = Dict(
     :inversed => (e = 0.8, Z = 0.1, a = 10),
-    :pyramid => (e = 0.5, Z = 0.8, a = 10),
+    :pyramid => (e = 0.8, Z = 0.8, a = 4),
     :cascade => (e = 0.8, Z = 0.8, a = 15),
 )
 
@@ -53,11 +55,11 @@ for (key, params) in params_dict
     iter = 0
     Beq = fill(-1, S)
     while any(Beq .< 1e-2) && iter < 10_000
-        c = create_trophic_community(n_per_tl; D_e, D_a, D_c, Z = params.Z)
+        global c = create_trophic_community(n_per_tl; D_e, D_a, D_c, Z = params.Z)
         Beq = abundance(c)
         iter += 1
     end
-    @info Beq
+    @info all(Beq .> 0)
     com_dict[key] = c
 end
 
@@ -68,8 +70,7 @@ df = DataFrame(;
     s = Float64[],
     B = Float64[],
 )
-
-n_rep = 1_000
+n_rep = 10_000
 D = LogNormal(log(0.01), 0.5)
 tl = vcat([fill(i, n) for (i, n) in enumerate(n_per_tl)]...)
 for (key, c) in com_dict
@@ -87,6 +88,7 @@ for (key, c) in com_dict
         append!(df, (com = fill(key, S), tl = tl, sl = ry, s = s, B = Beq))
     end
 end
+df_avg = combine(groupby(df, [:com, :tl, :sl, :B]), :s => mean)
 
 function predict_sl(e, Z, a, B_per_tl, S_per_tl)
     S = sum(S_per_tl)
@@ -101,8 +103,11 @@ function predict_sl(e, Z, a, B_per_tl, S_per_tl)
     pred
 end
 
-
-df_avg = combine(groupby(df, [:com, :tl, :sl, :B]), :s => mean)
+function predict_s(sl, D_press; v = 1)
+    press_vals = rand(D_press, 100_000)
+    p = mean(press_vals) / harmmean(press_vals)
+    v / sl * (1 - p) + p
+end
 
 inch = 96
 pt = 4 / 3
@@ -120,8 +125,10 @@ for (i, com) in enumerate(keys(com_dict))
     B_tl = [mean(df_com.B[df_com.tl.==t]) for t in tl_unique]
     p = params_dict[com]
     sl_pred = predict_sl(p.e, p.Z, p.a, B_tl, n_per_tl)
+    s_pred = predict_s.(sl_pred, D)
     barplot!(tl_unique, B_tl; color = :grey, direction = :x)
     scatter!(ax1, tl_unique, sl_pred; color = :red)
+    scatter!(ax2, tl_unique, s_pred; color = :red)
     Label(fig[i, 4], string(com); rotation = 3pi / 2, tellheight = false)
 end
 fig
@@ -145,9 +152,56 @@ for (i, com) in enumerate(keys(com_dict))
     B_tl = [mean(df_com.B[df_com.tl.==t]) for t in tl_unique]
     p = params_dict[com]
     sl_pred = predict_sl(p.e, p.Z, p.a, B_tl, n_per_tl)
+    s_pred = predict_s.(sl_pred, D)
+    # scatter!(ax2, tl_unique[2:end], s_pred[2:end]; color = :red)
     barplot!(tl_unique, B_tl; color = :grey, direction = :x)
     scatter!(ax1, tl_unique[2:end], sl_pred[2:end]; color = :red)
     Label(fig[i, 4], string(com); rotation = 3pi / 2, tellheight = false)
+end
+fig
+
+inch = 96
+pt = 4 / 3
+cm = inch / 2.54
+width = 15cm
+color_dict = Dict(1 => :black, 2 => :gray47, 3 => :grey66, 4 => :gray80)
+fig = Figure(; size = (width, width), fontsize = 10pt);
+for (i, com) in enumerate(keys(com_dict))
+    ax = Axis(fig[0, i]; xlabel = "Total biomass", ylabel = "Trophic level")
+    df_com = subset(df_avg, :com => ByRow(==(com)))
+    tl_unique = sort(unique(df_com.tl))
+    B_tl = [mean(df_com.B[df_com.tl.==t]) for t in tl_unique]
+    p = params_dict[com]
+    barplot!(tl_unique, B_tl; direction = :x, color = [color_dict[i] for i in 1:n_tl])
+    for (j, df_tl) in enumerate(groupby(df_com, :tl))
+        tl = df_tl.tl |> first
+        color = color_dict[tl]
+        xlabel = j == 1 ? "1 / SL" : ""
+        ylabel = i == 1 ? "Sensitivity" : ""
+        ax = Axis(fig[n_tl-j+1, i]; xlabel, ylabel)
+        scatter!(1 ./ df_tl.sl, df_tl.s_mean; color)
+    end
+end
+fig
+
+
+inch = 96
+pt = 4 / 3
+cm = inch / 2.54
+width = 13cm
+fig = Figure(; size = (0.5width, width), fontsize = 10pt);
+for (i, com) in enumerate(keys(com_dict))
+    df_com = subset(df_avg, :com => ByRow(==(com)))
+    ax = Axis(
+        fig[i, 1];
+        xlabel = "SL",
+        ylabel = "Sensitivity",
+        yscale = Makie.pseudolog10,
+        xscale = Makie.pseudolog10,
+    )
+    for df_tl in groupby(df_com, :tl)
+        scatter!(1 ./ df_tl.sl, df_tl.s_mean)
+    end
 end
 fig
 
