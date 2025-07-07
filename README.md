@@ -1,6 +1,3 @@
 # Species stability in food webs
 
-## Todo
-
-- [ ] Makefile
-
+Expanding SL theory to food webs.
